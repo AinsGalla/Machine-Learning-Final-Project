@@ -1,0 +1,280 @@
+---
+title: "Final Project STAT427"
+output: html_document
+date: "2025-05-02"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(pls)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(rsample)
+library(yardstick)
+library(purrr)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Telling R to skip the first line because exported the csv file using Apple Numbers and it likes to add an extra row at the top that cost me way too much time.
+cdi <- read_csv("STAT427_Chronic_Illness_CSV.csv", skip = 1, show_col_types = FALSE)
+```
+
+
+```{r}
+#Cleaning Data
+#Alcohol Use
+alcohol <- cdi %>%
+  filter(Question == "Binge drinking prevalence among adults") %>%
+  filter(DataValueType == "Crude Prevalence") %>%
+  drop_na(DataValue) %>%
+  select(YearStart, LocationDesc, StratificationCategory1, Stratification1,
+         DataValue) %>%
+  rename(AlcoholUse = DataValue)
+
+#Liver Disease Mortality
+liver <- cdi %>%
+  filter(Question == "Chronic liver disease mortality among all people, underlying cause") %>%
+  filter(DataValueType == "Crude Rate") %>%
+  drop_na(DataValue) %>%
+  select(YearStart, LocationDesc, StratificationCategory1, Stratification1,
+         DataValue) %>%
+  rename(LiverMortality = DataValue)
+
+#Joining
+joined_data <- left_join(alcohol, liver, 
+                         by = c("YearStart", "LocationDesc", "StratificationCategory1", "Stratification1")) %>%
+  filter(!is.na(AlcoholUse), !is.na(LiverMortality))
+
+joined_data$Stratification1 <- as.factor(joined_data$Stratification1)
+joined_data$LocationDesc <- as.factor(joined_data$LocationDesc)
+
+```
+
+```{r}
+#Does it look right?
+nrow(alcohol)
+nrow(liver)
+nrow(joined_data)
+head(joined_data)
+summary(joined_data)
+joined_data %>% filter(LiverMortality > 100)
+```
+
+```{r}
+#Distribution Graphs
+joined_data %>%
+  ggplot(aes(x = AlcoholUse)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of Adult Binge Drinking", x = "% Binge Drinking", y = "Frequency")
+
+joined_data %>%
+  ggplot(aes(x = LiverMortality)) +
+  geom_histogram(binwidth = 5, fill = "tomato", color = "black") +
+  labs(title = "Distribution of Liver Disease Mortality", x = "Mortality Rate", y = "Frequency")
+```
+
+PCR
+
+```{r}
+#matrix
+X <- model.matrix(LiverMortality ~ AlcoholUse + Stratification1 + LocationDesc, data = joined_data)[, -1]
+Y <- joined_data$LiverMortality
+
+pcr_model <- pcr(Y ~ X, scale = TRUE, validation = "CV")
+
+# Components Plot
+validationplot(pcr_model, val.type = "RMSEP", main = "Cross-Validation RMSEP for PCR") 
+
+rmsep_vals <- RMSEP(pcr_model)$val[1,1,-1]  # Drop intercept
+opt_ncomp <- which.min(rmsep_vals)
+cat("Optimal number of components:", opt_ncomp, "\n")
+
+#Comparing 62components to 10
+rmsep_vals[10]  
+rmsep_vals[62]  
+
+```
+
+
+```{r}
+# Predictions
+preds <- predict(pcr_model, ncomp = opt_ncomp)
+df_pred <- data.frame(Actual = Y, Predicted = preds[,1,1])
+
+#Plot
+ggplot(df_pred, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "darkred") +
+  labs(title = paste("PCR: Predicted vs Actual Liver Mortality (", opt_ncomp, " PCs)", sep = ""),
+       x = "Actual Liver Mortality", y = "Predicted Liver Mortality") +
+  theme_minimal()
+
+#R² and RMSE
+SSE <- sum((df_pred$Actual - df_pred$Predicted)^2)
+SST <- sum((df_pred$Actual - mean(df_pred$Actual))^2)
+R2 <- 1 - SSE/SST
+RMSE <- sqrt(mean((df_pred$Actual - df_pred$Predicted)^2))
+
+cat("PCR R-squared:", round(R2, 3), "\n")
+cat("PCR RMSE:", round(RMSE, 3), "\n")
+```
+
+
+```{r}
+# Prepare predictors
+X <- model.matrix(LiverMortality ~ . - 1, data = joined_data)
+
+pca <- prcomp(X, scale. = TRUE)
+
+pc_scores <- as.data.frame(pca$x) 
+pc_scores$Group <- paste(joined_data$LocationDesc, joined_data$Stratification1, sep = " - ")
+
+```
+
+
+```{r}
+# Top & Bottom 10, PC1
+top_bottom_pc1 <- pc_scores %>%
+  arrange(desc(PC1)) %>%
+  slice(c(1:10, (n() - 9):n()))
+
+ggplot(top_bottom_pc1, aes(x = reorder(Group, PC1), y = PC1)) +
+  geom_col(aes(fill = PC1 > 0)) +
+  coord_flip() +
+  labs(title = "Top and Bottom Groups by PC1 Score",
+       x = "Group (State - Demographic)", y = "PC1 Score") +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "tomato")) +
+  theme_minimal()
+```
+
+```{r}
+# Top & Bottom 10, PC2
+top_bottom_pc2 <- pc_scores %>%
+  arrange(desc(PC2)) %>%
+  slice(c(1:10, (n() - 9):n()))
+
+ggplot(top_bottom_pc2, aes(x = reorder(Group, PC2), y = PC2)) +
+  geom_col(aes(fill = PC2 > 0)) +
+  coord_flip() +
+  labs(title = "Top and Bottom Groups by PC2 Score",
+       x = "Group (State - Demographic)", y = "PC2 Score") +
+  scale_fill_manual(values = c("TRUE" = "darkgreen", "FALSE" = "orange")) +
+  theme_minimal()
+```
+
+
+Regression and Classification Trees
+
+```{r}
+state_region_df <- data.frame(
+  LocationDesc = state.name,
+  region = state.region
+)
+
+joined_data <- joined_data %>%
+  left_join(state_region_df, by = "LocationDesc")
+
+```
+
+```{r}
+ggplot(joined_data, aes(x = region, y = LiverMortality)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(title = "Liver Mortality by U.S. Region", x = "Region", y = "Mortality Rate")
+```
+
+
+```{r}
+# Abbreviate labels to avoid overlap
+joined_data$StratShort <- abbreviate(joined_data$Stratification1, minlength = 4)
+joined_data$LocShort <- abbreviate(joined_data$LocationDesc, minlength = 4)
+
+# Fit the regression tree using abbreviated labels
+reg_tree <- rpart(LiverMortality ~ AlcoholUse + Stratification1 + region,
+                  data = joined_data, method = "anova")
+
+
+# Plot regression tree
+rpart.plot(
+  reg_tree,
+  main = "Regression Tree for Liver Mortality",
+  extra = 101,
+  cex = 0.7,
+  box.palette = "RdBu",
+  fallen.leaves = TRUE,
+  tweak = .5,
+  faclen = 0,
+  split.fun = function(x, labs, digits, varlen, faclen) {
+    # Wrap each label in the vector individually
+    sapply(labs, function(label) paste(strwrap(label, width = 25), collapse = "\n"))
+  }
+)
+
+# Predict and evaluate RMSE
+predicted <- predict(reg_tree, joined_data)
+rmse_reg <- sqrt(mean((predicted - joined_data$LiverMortality)^2))
+cat("Regression Tree RMSE:", round(rmse_reg, 2), "\n")
+
+```
+
+```{r}
+#is it a good model?
+#RMSE
+predicted_reg <- predict(reg_tree, newdata = joined_data)
+rmse_reg <- sqrt(mean((predicted_reg - joined_data$LiverMortality)^2))
+cat("Regression Tree RMSE:", round(rmse_reg, 2), "\n")
+
+joined_data$Stratification1 <- as.factor(joined_data$Stratification1)
+
+# Create 10-fold cross-validation splits
+set.seed(123)
+cv_folds <- vfold_cv(joined_data, v = 10)
+
+# Function to fit and evaluate classification model
+fit_class_model <- function(split) {
+  train_data <- analysis(split)
+  test_data <- assessment(split)
+  
+model <- rpart(Stratification1 ~ AlcoholUse + LiverMortality, 
+               data = train_data, method = "class")
+  
+  predictions <- predict(model, test_data, type = "class")
+  
+  accuracy_val <- accuracy_vec(truth = test_data$Stratification1, estimate = predictions)
+  return(accuracy_val)
+}
+
+# Apply function and average accuracy
+cv_results <- cv_folds %>%
+  mutate(accuracy = map_dbl(splits, fit_class_model))
+
+mean_accuracy <- mean(cv_results$accuracy)
+cat("Cross-validated Classification Tree Accuracy:", round(mean_accuracy, 3), "\n")
+```
+
+
+
+```{r}
+# Simplify labels or else it looks bad
+joined_data$StratShort <- abbreviate(joined_data$Stratification1, minlength = 6)
+joined_data$LocShort <- abbreviate(joined_data$LocationDesc, minlength = 4)
+
+joined_data$MortalityLevel <- ifelse(joined_data$LiverMortality > median(joined_data$LiverMortality), "High", "Low")
+
+# Build tree
+tree_model <- rpart(MortalityLevel ~ AlcoholUse + StratShort + LocShort,
+                    data = joined_data, method = "class", cp = 0.01)
+
+#Plot manually for spacing
+rpart.plot(tree_model,
+           type = 2,                  
+           extra = 104,              
+           box.palette = "RdBu",
+           fallen.leaves = TRUE,
+           tweak = 0.7,               
+           faclen = 0,                
+           shadow.col = "gray",       
+           space = 0.7)         
+```
+
